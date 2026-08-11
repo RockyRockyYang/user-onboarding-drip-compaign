@@ -9,5 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
+# macOS
+.DS_Store
+
 # Personal planning notes, not for the repo
 Planning.md
