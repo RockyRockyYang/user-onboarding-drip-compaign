@@ -31,6 +31,8 @@ async def main():
     """
     client = await Client.connect("localhost:7233")
     user_id = f"user-{uuid.uuid4().hex[:8]}"
+    print(f"Starting onboarding workflow: onboarding-{user_id}")
+
     result = await client.execute_workflow(
         OnboardingWorkflow.run,
         user_id,
