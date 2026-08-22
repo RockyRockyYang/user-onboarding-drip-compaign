@@ -4,7 +4,20 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from activities import send_reminder_email, send_welcome_email
+    from activities import (
+        send_reminder_email,
+        send_second_reminder_email,
+        send_welcome_email,
+        send_winback_email,
+    )
+
+# (activity 函数, 等待时长) —— 每一级"没激活就发这封邮件"用的是同一套
+# wait_condition 竞态逻辑，只有 activity 和等待时长不一样，抽成数据驱动循环
+REMINDER_STAGES = [
+    (send_reminder_email, timedelta(seconds=10)),  # 代表 3 天
+    (send_second_reminder_email, timedelta(seconds=15)),  # 代表 7 天(累计 10 天)
+    (send_winback_email, timedelta(seconds=20)),  # 代表 20 天(累计 30 天)
+]
 
 
 @workflow.defn
@@ -65,6 +78,13 @@ class OnboardingWorkflow:
     这也是为什么 History 里等待期间会先出现 TimerStarted（wait_condition
     底层设的超时计时器），如果信号先到，这个 Timer 还没触发就已经不再
     影响流程了。
+
+    Phase 3 (6a/6b) 更新：原来"只有一级、等一次"的 wait_condition，现在
+    循环三次（REMINDER_STAGES），每一级复用同一套竞态逻辑：
+      - 某一级超时（没激活）→ 发那一级对应的邮件 → continue 进下一级
+      - 任意一级 wait_condition 正常返回（激活了）→ 直接 return，不再进入
+        后面的级别
+      - 三级都跑完还没激活 → return "churned"
     """
 
     def __init__(self) -> None:
@@ -82,21 +102,25 @@ class OnboardingWorkflow:
             start_to_close_timeout=timedelta(seconds=10),
         )
 
-        # 代表"3 天未激活"的等待窗口，demo 里压缩成 20 秒；
-        # 谁先发生：信号到达（_pending 非空）还是 20 秒超时
-        try:
-            await workflow.wait_condition(
-                lambda: len(self._pending) > 0,
-                timeout=timedelta(seconds=20),
-            )
-        except asyncio.TimeoutError:
-            # 20 秒到了，期间没收到激活信号 → 照常发 reminder
-            await workflow.execute_activity(
-                send_reminder_email,
-                user_id,
-                start_to_close_timeout=timedelta(seconds=10),
-            )
-            return "reminder_sent"
+        for reminder_activity, wait_time in REMINDER_STAGES:
+            # 谁先发生：信号到达（_pending 非空）还是这一级的超时
+            try:
+                await workflow.wait_condition(
+                    lambda: len(self._pending) > 0,
+                    timeout=wait_time,
+                )
+            except asyncio.TimeoutError:
+                # 这一级超时了，期间没收到激活信号 → 发这一级对应的邮件，
+                # 进入下一级继续等
+                await workflow.execute_activity(
+                    reminder_activity,
+                    user_id,
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
+                continue
 
-        # wait_condition 正常返回 = 条件在超时前变成了 True，即信号先到了
-        return "activated"
+            # wait_condition 正常返回 = 条件在超时前变成了 True，即信号先到了
+            return "activated"
+
+        # 三级 for 循环都跑完了，还是没激活
+        return "churned"
