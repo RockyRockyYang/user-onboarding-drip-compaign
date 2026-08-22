@@ -11,12 +11,13 @@ with workflow.unsafe.imports_passed_through():
         send_winback_email,
     )
 
-# (activity 函数, 等待时长) —— 每一级"没激活就发这封邮件"用的是同一套
-# wait_condition 竞态逻辑，只有 activity 和等待时长不一样，抽成数据驱动循环
+# (stage 名字, activity 函数, 等待时长) —— 每一级"没激活就发这封邮件"用的是
+# 同一套 wait_condition 竞态逻辑，只有名字/activity/等待时长不一样，
+# 抽成数据驱动循环。stage 名字同时也是 Query 能查到的 _current_stage 的值。
 REMINDER_STAGES = [
-    (send_reminder_email, timedelta(seconds=10)),  # 代表 3 天
-    (send_second_reminder_email, timedelta(seconds=15)),  # 代表 7 天(累计 10 天)
-    (send_winback_email, timedelta(seconds=20)),  # 代表 20 天(累计 30 天)
+    ("reminder_1", send_reminder_email, timedelta(seconds=10)),  # 代表 3 天
+    ("reminder_2", send_second_reminder_email, timedelta(seconds=15)),  # 代表 7 天(累计 10 天)
+    ("winback", send_winback_email, timedelta(seconds=20)),  # 代表 20 天(累计 30 天)
 ]
 
 
@@ -85,14 +86,28 @@ class OnboardingWorkflow:
       - 任意一级 wait_condition 正常返回（激活了）→ 直接 return，不再进入
         后面的级别
       - 三级都跑完还没激活 → return "churned"
+
+    Phase 4 (7a) 更新：加了 self._current_stage + get_current_stage 这个
+    Query。Query handler 必须是同步方法（没有 async/await），不能调用
+    execute_activity/sleep/wait_condition 这些会产出命令的 API —— 因为
+    Query 不允许产生任何新的 History 事件，纯粹是"读现有状态，不打扰这个
+    workflow 未来的重放结果"。它能拿到正确答案，靠的是：查询时如果这个
+    workflow 没缓存在内存里，worker 会做一次只读的重放，把
+    self._current_stage 之类的实例状态重建出来，重放完直接读，不产生
+    任何新命令交回 Server。
     """
 
     def __init__(self) -> None:
         self._pending: list[str] = []
+        self._current_stage: str = "welcome"
 
     @workflow.signal
     def user_activated(self) -> None:
         self._pending.append("activated")
+
+    @workflow.query
+    def get_current_stage(self) -> str:
+        return self._current_stage
 
     @workflow.run
     async def run(self, user_id: str) -> str:
@@ -102,7 +117,8 @@ class OnboardingWorkflow:
             start_to_close_timeout=timedelta(seconds=10),
         )
 
-        for reminder_activity, wait_time in REMINDER_STAGES:
+        for stage_name, reminder_activity, wait_time in REMINDER_STAGES:
+            self._current_stage = stage_name
             # 谁先发生：信号到达（_pending 非空）还是这一级的超时
             try:
                 await workflow.wait_condition(
@@ -120,7 +136,9 @@ class OnboardingWorkflow:
                 continue
 
             # wait_condition 正常返回 = 条件在超时前变成了 True，即信号先到了
+            self._current_stage = "activated"
             return "activated"
 
         # 三级 for 循环都跑完了，还是没激活
+        self._current_stage = "churned"
         return "churned"
