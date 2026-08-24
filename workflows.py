@@ -3,7 +3,7 @@ from datetime import timedelta
 from enum import StrEnum
 
 from temporalio import workflow
-from temporalio.common import SearchAttributeKey
+from temporalio.common import RetryPolicy, SearchAttributeKey
 
 with workflow.unsafe.imports_passed_through():
     from activities import (
@@ -28,14 +28,22 @@ class Stage(StrEnum):
     NEEDS_MANUAL_FOLLOWUP = "needs_manual_followup"
 
 
-# (stage, activity 函数, 等待时长, heartbeat_timeout) —— 每一级"没激活就发这封邮件"
-# 用的是同一套 wait_condition 竞态逻辑，只有 stage/activity/等待时长不一样，
-# 抽成数据驱动循环。heartbeat_timeout 只有 winback 用到(模拟慢 activity)，
-# 其余是 None，表示不用心跳监控。
+# (stage, activity 函数, 等待时长, heartbeat_timeout, retry_policy) —— 每一级
+# "没激活就发这封邮件"用的是同一套 wait_condition 竞态逻辑，只有
+# stage/activity/等待时长不一样，抽成数据驱动循环。heartbeat_timeout 和
+# retry_policy 只有 winback 用到:heartbeat_timeout 模拟慢 activity 的心跳
+# 监控；retry_policy 给它的重试设个上限(默认是无限重试)，不然一旦真的
+# 永久失败，会一直重试下去，永远走不到下面的补偿分支。
 REMINDER_STAGES = [
-    (Stage.REMINDER_1, send_reminder_email, timedelta(seconds=10), None),  # 代表 3 天
-    (Stage.REMINDER_2, send_second_reminder_email, timedelta(seconds=15), None),  # 代表 7 天(累计 10 天)
-    (Stage.WINBACK, send_winback_email, timedelta(seconds=20), timedelta(seconds=3)),  # 代表 20 天(累计 30 天)
+    (Stage.REMINDER_1, send_reminder_email, timedelta(days=3), None, None),
+    (Stage.REMINDER_2, send_second_reminder_email, timedelta(days=7), None, None),  # 累计 10 天
+    (
+        Stage.WINBACK,
+        send_winback_email,
+        timedelta(days=20),  # 累计 30 天
+        timedelta(seconds=3),
+        RetryPolicy(maximum_attempts=3),
+    ),
 ]
 
 # 对应 `temporal operator search-attribute create --name stage --type Keyword`
@@ -84,7 +92,7 @@ class OnboardingWorkflow:
             start_to_close_timeout=timedelta(seconds=10),
         )
 
-        for stage, reminder_activity, wait_time, heartbeat_timeout in REMINDER_STAGES:
+        for stage, reminder_activity, wait_time, heartbeat_timeout, retry_policy in REMINDER_STAGES:
             self._set_stage(stage)
             # 谁先发生：信号到达（_pending 非空）还是这一级的超时
             try:
@@ -101,6 +109,7 @@ class OnboardingWorkflow:
                         user_id,
                         start_to_close_timeout=timedelta(seconds=10),
                         heartbeat_timeout=heartbeat_timeout,
+                        retry_policy=retry_policy,
                     )
                 except Exception:
                     # 补偿 = 发起新的正向动作，不是撤销已经发出去的邮件。
