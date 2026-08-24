@@ -1,3 +1,5 @@
+import asyncio
+
 from temporalio import activity
 
 
@@ -20,6 +22,15 @@ async def send_second_reminder_email(user_id: str) -> str:
 
 
 @activity.defn
+async def notify_manual_followup_needed(user_id: str) -> str:
+    print(f"[Ops Alert] {user_id} needs manual follow-up (winback email failed permanently)")
+    return "notified"
+
+
+@activity.defn
 async def send_winback_email(user_id: str) -> str:
+    for i in range(5):
+        await asyncio.sleep(1)  # 模拟卡住的第三方 API,分成几段慢慢跑
+        activity.heartbeat(f"step {i + 1}/5")  # 每一段结束后汇报一次"我还活着"
     print(f"[Email] Win-back email sent to {user_id}")
     return "winback_sent"

@@ -7,6 +7,7 @@ from temporalio.common import SearchAttributeKey
 
 with workflow.unsafe.imports_passed_through():
     from activities import (
+        notify_manual_followup_needed,
         send_reminder_email,
         send_second_reminder_email,
         send_welcome_email,
@@ -24,15 +25,17 @@ class Stage(StrEnum):
     WINBACK = "winback"
     ACTIVATED = "activated"
     CHURNED = "churned"
+    NEEDS_MANUAL_FOLLOWUP = "needs_manual_followup"
 
 
-# (stage, activity 函数, 等待时长) —— 每一级"没激活就发这封邮件"用的是
-# 同一套 wait_condition 竞态逻辑，只有 stage/activity/等待时长不一样，
-# 抽成数据驱动循环。
+# (stage, activity 函数, 等待时长, heartbeat_timeout) —— 每一级"没激活就发这封邮件"
+# 用的是同一套 wait_condition 竞态逻辑，只有 stage/activity/等待时长不一样，
+# 抽成数据驱动循环。heartbeat_timeout 只有 winback 用到(模拟慢 activity)，
+# 其余是 None，表示不用心跳监控。
 REMINDER_STAGES = [
-    (Stage.REMINDER_1, send_reminder_email, timedelta(seconds=10)),  # 代表 3 天
-    (Stage.REMINDER_2, send_second_reminder_email, timedelta(seconds=15)),  # 代表 7 天(累计 10 天)
-    (Stage.WINBACK, send_winback_email, timedelta(seconds=20)),  # 代表 20 天(累计 30 天)
+    (Stage.REMINDER_1, send_reminder_email, timedelta(seconds=10), None),  # 代表 3 天
+    (Stage.REMINDER_2, send_second_reminder_email, timedelta(seconds=15), None),  # 代表 7 天(累计 10 天)
+    (Stage.WINBACK, send_winback_email, timedelta(seconds=20), timedelta(seconds=3)),  # 代表 20 天(累计 30 天)
 ]
 
 # 对应 `temporal operator search-attribute create --name stage --type Keyword`
@@ -81,7 +84,7 @@ class OnboardingWorkflow:
             start_to_close_timeout=timedelta(seconds=10),
         )
 
-        for stage, reminder_activity, wait_time in REMINDER_STAGES:
+        for stage, reminder_activity, wait_time, heartbeat_timeout in REMINDER_STAGES:
             self._set_stage(stage)
             # 谁先发生：信号到达（_pending 非空）还是这一级的超时
             try:
@@ -92,11 +95,28 @@ class OnboardingWorkflow:
             except asyncio.TimeoutError:
                 # 这一级超时了，期间没收到激活信号 → 发这一级对应的邮件，
                 # 进入下一级继续等
-                await workflow.execute_activity(
-                    reminder_activity,
-                    user_id,
-                    start_to_close_timeout=timedelta(seconds=10),
-                )
+                try:
+                    await workflow.execute_activity(
+                        reminder_activity,
+                        user_id,
+                        start_to_close_timeout=timedelta(seconds=10),
+                        heartbeat_timeout=heartbeat_timeout,
+                    )
+                except Exception:
+                    # 补偿 = 发起新的正向动作，不是撤销已经发出去的邮件。
+                    # 只有最后一级（winback）失败才是真的没有下一次机会了，
+                    # 标记"需要人工介入"、让 workflow 体面结束；前两级失败
+                    # 就让异常照常往上抛，workflow 直接 Failed（还有后续
+                    # 级别可以再试，不需要在这里特殊处理）。
+                    if stage == Stage.WINBACK:
+                        await workflow.execute_activity(
+                            notify_manual_followup_needed,
+                            user_id,
+                            start_to_close_timeout=timedelta(seconds=10),
+                        )
+                        self._set_stage(Stage.NEEDS_MANUAL_FOLLOWUP)
+                        return Stage.NEEDS_MANUAL_FOLLOWUP.value
+                    raise
                 continue
 
             # wait_condition 正常返回 = 条件在超时前变成了 True，即信号先到了

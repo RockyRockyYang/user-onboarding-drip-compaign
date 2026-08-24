@@ -4,6 +4,7 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from activities import (
+    notify_manual_followup_needed,
     send_reminder_email,
     send_second_reminder_email,
     send_welcome_email,
@@ -29,6 +30,7 @@ async def main():
             send_reminder_email,
             send_second_reminder_email,
             send_winback_email,
+            notify_manual_followup_needed,
         ],
     )
     print(f"Worker started, polling task queue '{TASK_QUEUE}'...")
